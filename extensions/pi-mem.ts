@@ -739,6 +739,93 @@ export default function piMemExtension(pi: ExtensionAPI) {
   });
 
   // =========================================================================
+  // Tool: memory_forget — Delete observations
+  //
+  // Delete specific observations by ID, or search and delete matching.
+  // Use for scrubbing sensitive data (tokens, credentials) or removing
+  // unwanted observations from the memory database.
+  // =========================================================================
+
+  pi.registerTool({
+    name: "memory_forget",
+    label: "Memory Forget",
+    description:
+      "Delete observations from memory by ID. Use to remove sensitive data (tokens, credentials, PII) or unwanted observations. Supports direct ID deletion or search-then-delete.",
+    parameters: Type.Object({
+      ids: Type.Optional(Type.Array(Type.Number({ description: "Observation IDs to delete (e.g. [123, 456])" }))),
+      query: Type.Optional(Type.String({ description: "Search query — finds matching observations and deletes them all" })),
+      limit: Type.Optional(Type.Number({ description: "Max results to delete when using query (default: 20)" })),
+    }),
+
+    async execute(_toolCallId, params) {
+      let idsToDelete: number[] = [];
+
+      // Direct ID deletion
+      if (Array.isArray(params.ids) && params.ids.length > 0) {
+        idsToDelete = params.ids.map(Number).filter((n) => Number.isFinite(n));
+      }
+      // Search-then-delete
+      else if (params.query) {
+        const query = encodeURIComponent(String(params.query));
+        const limit = Math.min(params.limit || 20, MAX_SEARCH_LIMIT);
+        const project = encodeURIComponent(projectName);
+        const searchResult = await workerGetText(
+          `/api/search?query=${query}&limit=${limit}&project=${project}`
+        );
+
+        if (!searchResult) {
+          return {
+            content: [{ type: "text" as const, text: "No matching observations found." }],
+            details: undefined,
+          };
+        }
+
+        // Extract IDs from search results
+        try {
+          const parsed = JSON.parse(searchResult);
+          const results = parsed.content || parsed.results || parsed;
+          if (Array.isArray(results)) {
+            idsToDelete = results
+              .map((r: Record<string, unknown>) => Number(r.id))
+          .filter((n: number) => Number.isFinite(n));
+          }
+        } catch {
+          // Fallback: try regex extraction of IDs
+          const idMatches = searchResult.match(/\|\s*(\d+)\s*\|/g);
+          if (idMatches) {
+            idsToDelete = idMatches
+              .map((m: string) => Number(m.replace(/\|/g, "").trim()))
+              .filter((n: number) => Number.isFinite(n));
+          }
+        }
+      }
+
+      if (idsToDelete.length === 0) {
+        return {
+          content: [{ type: "text" as const, text: "No observation IDs provided or found. Supply `ids` array or `query` string." }],
+          details: undefined,
+        };
+      }
+
+      // Call the forget endpoint
+      const result = await workerPost("/api/observations/forget", { ids: idsToDelete });
+
+      if (!result) {
+        return {
+          content: [{ type: "text" as const, text: "Failed to delete observations — worker returned error." }],
+          details: undefined,
+        };
+      }
+
+      const text = `Forgot ${result.deleted} observation(s). IDs: ${idsToDelete.join(", ")}`;
+      return {
+        content: [{ type: "text" as const, text }],
+        details: undefined,
+      };
+    },
+  });
+
+  // =========================================================================
   // Tool: corpus_manage — Corpus Management
   //
   // Build, list, query, and delete knowledge corpora from the worker.
