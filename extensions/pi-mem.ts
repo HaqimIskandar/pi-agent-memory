@@ -97,6 +97,16 @@ const CONTEXT_OBSERVATION_COUNT = parseInt(
   10
 );
 
+// Phase 6: Durable memory priority — inject curated durable memories before recent observations
+const DURABLE_PRIORITY_ENABLED =
+  process.env.PI_MEM_DURABLE_PRIORITY !== "false" &&
+  String(SETTINGS.CLAUDE_MEM_DURABLE_PRIORITY || "true") !== "false";
+const DURABLE_CONTEXT_SLOTS = parseInt(
+  process.env.PI_MEM_DURABLE_SLOTS || String(SETTINGS.CLAUDE_MEM_DURABLE_SLOTS || "30"),
+  10
+);
+const DURABLE_MEMORY_FILE = join(homedir(), "SIX", "DURABLE_MEMORY.md");
+
 // Gap 1: Observation buffer location
 // Dedup: per-tool cooldown window — suppress rapid-fire observations from same tool
 const DEDUP_WINDOW_MS = parseInt(
@@ -557,15 +567,59 @@ export default function piMemExtension(pi: ExtensionAPI) {
   // Gap 5: Pass search filters to context endpoint.
   // =========================================================================
 
+  // Phase 6: Load durable memory content from dreaming-promoted DURABLE_MEMORY.md
+  function loadDurableMemory(): string | null {
+    if (!DURABLE_PRIORITY_ENABLED) return null;
+    try {
+      if (!existsSync(DURABLE_MEMORY_FILE)) return null;
+      const raw = readFileSync(DURABLE_MEMORY_FILE, "utf-8").trim();
+      if (!raw || raw.length < 20) return null;
+      // Extract only the entry lines (lines starting with - **)
+      const lines = raw.split("\n").filter(l => l.startsWith("- **"));
+      if (lines.length === 0) return null;
+      // Cap at DURABLE_CONTEXT_SLOTS entries to control token budget
+      const capped = lines.slice(0, DURABLE_CONTEXT_SLOTS);
+      return `Durable Memory (promoted by dreaming — rules, decisions, architecture knowledge):\n${capped.join("\n")}`;
+    } catch {
+      return null;
+    }
+  }
+
   pi.on("context", async (event) => {
     if (!contentSessionId) return;
 
     const projects = encodeURIComponent(projectName);
+
+    // Phase 6: When durable priority enabled, reduce recent obs count to make room
+    const durableBlock = loadDurableMemory();
+    const recentObsCount = durableBlock
+      ? Math.max(20, CONTEXT_OBSERVATION_COUNT - DURABLE_CONTEXT_SLOTS)
+      : CONTEXT_OBSERVATION_COUNT;
+
     const contextText = await workerGetText(
-      `/api/context/inject?projects=${projects}&observations=${CONTEXT_OBSERVATION_COUNT}`
+      `/api/context/inject?projects=${projects}&observations=${recentObsCount}`
     );
 
-    if (!contextText || contextText.trim().length === 0) return;
+    if (!contextText || contextText.trim().length === 0) {
+      // Still inject durable block even if worker returns nothing
+      if (durableBlock) {
+        return {
+          messages: [
+            ...event.messages,
+            {
+              role: "user" as const,
+              content: [{ type: "text" as const, text: `<pi-mem-context>\n${durableBlock}\n</pi-mem-context>` }],
+            },
+          ],
+        };
+      }
+      return;
+    }
+
+    // Combine durable + recent situational
+    const combined = durableBlock
+      ? `${durableBlock}\n\n---\n\n${contextText}`
+      : contextText;
 
     return {
       messages: [
@@ -575,7 +629,7 @@ export default function piMemExtension(pi: ExtensionAPI) {
           content: [
             {
               type: "text" as const,
-              text: `<pi-mem-context>\n${contextText}\n</pi-mem-context>`,
+              text: `<pi-mem-context>\n${combined}\n</pi-mem-context>`,
             },
           ],
         },
@@ -1018,6 +1072,62 @@ export default function piMemExtension(pi: ExtensionAPI) {
           ctx.ui.notify(`pi-mem: Viewer opened at ${viewerUrl}`, "info");
         }
       });
+    },
+  });
+
+  // =========================================================================
+  // Phase 6: Command: /durable
+  //
+  // Show durable memory priority status and toggle on/off.
+  // =========================================================================
+  pi.registerCommand("durable", {
+    description: "Manage durable memory context priority (on/off/status)",
+    handler: async (args, ctx) => {
+      const sub = (args || "").trim().split(/\s+/)[0] || "status";
+
+      if (sub === "status") {
+        const enabled = DURABLE_PRIORITY_ENABLED;
+        const slots = DURABLE_CONTEXT_SLOTS;
+        let entryCount = 0;
+        try {
+          if (existsSync(DURABLE_MEMORY_FILE)) {
+            const raw = readFileSync(DURABLE_MEMORY_FILE, "utf-8");
+            entryCount = raw.split("\n").filter(l => l.startsWith("- **")).length;
+          }
+        } catch { /* ignore */ }
+
+        const obsCount = enabled ? Math.max(20, CONTEXT_OBSERVATION_COUNT - slots) : CONTEXT_OBSERVATION_COUNT;
+        ctx.ui.notify(
+          `🧠 Durable priority: ${enabled ? "ON" : "OFF"} | entries: ${entryCount} | durable slots: ${slots} | recent obs: ${obsCount}/${CONTEXT_OBSERVATION_COUNT}`,
+          "info",
+        );
+        return;
+      }
+
+      if (sub === "on" || sub === "off") {
+        const enable = sub === "on";
+        // Update settings.json to persist the preference
+        const settingsDir = process.env.CLAUDE_MEM_DATA_DIR || join(homedir(), ".claude-mem");
+        const settingsPath = join(settingsDir, "settings.json");
+        let settings: Record<string, unknown> = {};
+        try {
+          if (existsSync(settingsPath)) settings = JSON.parse(readFileSync(settingsPath, "utf-8"));
+        } catch { /* ignore */ }
+        settings.CLAUDE_MEM_DURABLE_PRIORITY = enable;
+        try {
+          mkdirSync(settingsDir, { recursive: true });
+          writeFileSync(settingsPath, JSON.stringify(settings, null, 2), "utf-8");
+          ctx.ui.notify(
+            `🧠 Durable priority ${enable ? "enabled" : "disabled"}. Takes effect next session.`,
+            "info",
+          );
+        } catch (e) {
+          ctx.ui.notify(`❌ Failed to update settings: ${e}`, "error");
+        }
+        return;
+      }
+
+      ctx.ui.notify("Usage: /durable [status|on|off]", "info");
     },
   });
 }
