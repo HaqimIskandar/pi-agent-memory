@@ -389,6 +389,37 @@ function deriveProjectName(cwd: string): string {
   return `pi-${dir}`;
 }
 
+/**
+ * Resolve the derived project name to a case-insensitive match
+ * from the worker's known projects. Falls back to derived name.
+ */
+async function resolveProjectName(derived: string): Promise<string> {
+  try {
+    const text = await workerGetText("/api/projects");
+    if (!text) return derived;
+    const data = JSON.parse(text);
+    const projects: string[] = data.projects ?? [];
+    const projectsBySource: Record<string, string[]> = data.projectsBySource ?? {};
+    const claudeProjects: string[] = projectsBySource.claude ?? [];
+    const lower = derived.toLowerCase();
+
+    // Collect all case-insensitive matches
+    const matches = projects.filter(p => p.toLowerCase() === lower);
+    if (matches.length > 0) {
+      // Prefer match from claude source (has historical data)
+      const claudeMatch = matches.find(m => claudeProjects.includes(m));
+      if (claudeMatch) return claudeMatch;
+      return matches[0];
+    }
+
+    // Try without "pi-" prefix (e.g. derived "pi-six" matches "SIX")
+    const bare = lower.replace(/^pi-/, "");
+    const bareMatches = claudeProjects.filter(p => p.toLowerCase() === bare);
+    if (bareMatches.length > 0) return bareMatches[0];
+  } catch { /* worker unreachable — use derived name */ }
+  return derived;
+}
+
 // =============================================================================
 // Extension Factory
 // =============================================================================
@@ -413,7 +444,8 @@ export default function piMemExtension(pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     sessionCwd = ctx.cwd;
-    projectName = deriveProjectName(sessionCwd);
+    const derived = deriveProjectName(sessionCwd);
+    projectName = derived;
     contentSessionId = `pi-${projectName}-${Date.now()}`;
 
     // Persist session ID into the session file for compaction recovery
@@ -427,6 +459,16 @@ export default function piMemExtension(pi: ExtensionAPI) {
       await attemptWorkerStart();
     } else {
       workerHealthy = true;
+    }
+
+    // Resolve project name case-insensitively against worker's known projects
+    if (workerHealthy) {
+      const resolved = await resolveProjectName(derived);
+      if (resolved !== projectName) {
+        console.error(`[pi-mem] Project resolved: ${projectName} → ${resolved}`);
+        projectName = resolved;
+        contentSessionId = `pi-${projectName}-${Date.now()}`;
+      }
     }
 
     // Gap 1: Flush any buffered observations from previous sessions
